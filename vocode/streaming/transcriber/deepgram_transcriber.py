@@ -8,6 +8,9 @@ import audioop
 from urllib.parse import urlencode
 from vocode import getenv
 
+from vocode.streaming.models.endpoint_classifier_model import EndpointClassifier
+
+
 from vocode.streaming.transcriber.base_transcriber import (
     BaseAsyncTranscriber,
     Transcription,
@@ -19,7 +22,7 @@ from vocode.streaming.models.transcriber import (
     EndpointingType,
 )
 from vocode.streaming.models.audio_encoding import AudioEncoding
-
+from vocode.streaming.models.endpoint_classifier_model import EndpointClassifier
 
 PUNCTUATION_TERMINATORS = [".", "!", "?"]
 NUM_RESTARTS = 5
@@ -60,6 +63,7 @@ class DeepgramTranscriber(BaseAsyncTranscriber[DeepgramTranscriberConfig]):
         self.is_ready = False
         self.logger = logger or logging.getLogger(__name__)
         self.audio_cursor = 0.
+        self.classifier = EndpointClassifier() 
 
     async def _run_loop(self):
         restarts = 0
@@ -123,50 +127,35 @@ class DeepgramTranscriber(BaseAsyncTranscriber[DeepgramTranscriberConfig]):
         url_params.update(extra_params)
         return f"wss://api.deepgram.com/v1/listen?{urlencode(url_params)}"
 
-    def is_speech_final(
-        self, current_buffer: str, deepgram_response: dict, time_silent: float
-    ):
-        transcript = deepgram_response["channel"]["alternatives"][0]["transcript"]
-
-        # if it is not time based, then return true if speech is final and there is a transcript
-        if not self.transcriber_config.endpointing_config:
-            return transcript and deepgram_response["speech_final"]
-        elif (
-            self.transcriber_config.endpointing_config.type
-            == EndpointingType.TIME_BASED
-        ):
-            # if it is time based, then return true if there is no transcript
-            # and there is some speech to send
-            # and the time_silent is greater than the cutoff
-            return (
-                not transcript
-                and current_buffer
-                and (time_silent + deepgram_response["duration"])
-                > self.transcriber_config.endpointing_config.time_cutoff_seconds
-            )
-        elif (
-            self.transcriber_config.endpointing_config.type
-            == EndpointingType.PUNCTUATION_BASED
-        ):
-            return (
-                transcript
-                and deepgram_response["speech_final"]
-                and transcript.strip()[-1] in PUNCTUATION_TERMINATORS
-            ) or (
-                not transcript
-                and current_buffer
-                and (time_silent + deepgram_response["duration"])
-                > self.transcriber_config.endpointing_config.time_cutoff_seconds
-            )
-        raise Exception("Endpointing config not supported")
-
     def calculate_time_silent(self, data: dict):
         end = data["start"] + data["duration"]
         words = data["channel"]["alternatives"][0]["words"]
         if words:
             return end - words[-1]["end"]
         return data["duration"]
+    def is_speech_final(
+        self, deep_response: dict, time_silent: float = 0.0
+    ):
+        transcript = deep_response["channel"]["alternatives"][0]["transcript"]
 
+        # this will be parameter based by default
+        if not self.transcriber_config.endpointing_config:
+            return (transcript and deep_response["speech_final"])
+        elif (
+            self.transcriber_config.endpointing_config.type
+            == EndpointingType.PUNCTUATION_BASED
+        ):
+            return (
+                transcript and transcript.strip()[-1] in PUNCTUATION_TERMINATORS and deep_response["speech_final"]
+            ) or (
+                False
+            )
+        elif (
+            self.transcriber_config.endpointing_config.type
+            == EndpointingType.CLASSIFIER_BASED
+        ):
+            return self.classifier.classify_text(transcript) or deep_response["speech_final"]
+        raise Exception("Endpointing config not supported")
     async def process(self):
         self.audio_cursor = 0.
         extra_headers = {"Authorization": f"Token {self.api_key}"}
@@ -220,7 +209,7 @@ class DeepgramTranscriber(BaseAsyncTranscriber[DeepgramTranscriberConfig]):
                     min_latency_hist.record(max(cur_min_latency, 0))
 
                     is_final = data["is_final"]
-                    speech_final = self.is_speech_final(buffer, data, time_silent)
+                    speech_final = self.is_speech_final(data, time_silent)
                     top_choice = data["channel"]["alternatives"][0]
                     confidence = top_choice["confidence"]
 
@@ -240,7 +229,7 @@ class DeepgramTranscriber(BaseAsyncTranscriber[DeepgramTranscriberConfig]):
                             Transcription(
                                 message=buffer,
                                 confidence=confidence,
-                                is_final=False,
+                                is_final=is_final,
                             )
                         )
                         time_silent = self.calculate_time_silent(data)

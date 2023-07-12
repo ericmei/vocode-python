@@ -43,6 +43,7 @@ class TwilioClient(BaseTelephonyClient):
             from_=from_phone,
             send_digits=digits,
             record=record,
+            **self.get_telephony_config().extra_params,
         )
         return twilio_call.sid
 
@@ -70,7 +71,6 @@ class TwilioClient(BaseTelephonyClient):
             return response.status == "completed"
 
         time.sleep(10) # for testing purposes only, if for some reason it just keeps going even when it's a conference
-
         response = self.twilio_client.calls(twilio_sid).update(status="completed")
         return response.status == "completed"
 
